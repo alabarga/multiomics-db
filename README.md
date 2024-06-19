@@ -1,4 +1,4 @@
-MULTIOMICS DB =====
+# MULTIOMICS DB
 
 [![image](https://github.com/bihealth/sodar-server/actions/workflows/build.yml/badge.svg)](https://github.com/bihealth/sodar-server/actions/workflows/build.yml)
 
