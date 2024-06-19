@@ -1,0 +1,2 @@
+* text=auto
+sodar/_version.py export-subst

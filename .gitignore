@@ -1,0 +1,124 @@
+### Documentation ###
+/docs_*/build/
+
+### Virtualenv ###
+.venv/
+
+### OSX ###
+.DS_Store
+.AppleDouble
+.LSOverride
+
+### SublimeText ###
+# cache files for sublime text
+*.tmlanguage.cache
+*.tmPreferences.cache
+*.stTheme.cache
+
+# workspace files are user-specific
+*.sublime-workspace
+
+# project files should be checked into the repository, unless a significant
+# proportion of contributors will probably not be using SublimeText
+# *.sublime-project
+
+# sftp configuration file
+sftp-config.json
+
+# Basics
+*.py[cod]
+__pycache__
+
+# Logs
+logs
+*.log
+pip-log.txt
+npm-debug.log*
+selenium-debug.log
+
+# Unit test / coverage reports
+.coverage
+.tox
+nosetests.xml
+htmlcov
+coverage.xml
+
+# Translations
+*.mo
+*.pot
+
+# Pycharm
+.idea/*
+docs/pycharm/*
+
+# Provided default Pycharm Run/Debug Configurations should be tracked by git
+# In case of local modifications made by Pycharm, use update-index command
+# for each changed file, like this:
+# git update-index --assume-unchanged .idea/omics_data_access.iml
+# !.idea/runConfigurations/
+# !.idea/omics_data_access.iml
+# !.idea/vcs.xml
+# !.idea/webResources.xml
+
+# Vim
+*~
+*.swp
+*.swo
+
+# Node.js and Webpack
+node_modules/
+dist/
+tests/node/unit/coverage/
+tests/node/e2e/reports/
+*.ntvs*
+*.njsproj
+webpack-stats.json
+
+# Compass
+.sass-cache
+
+# virtual environments
+.env
+
+# User-uploaded media
+sodar/media/
+
+# Static files
+staticfiles/
+
+# File handles
+.nfs*
+
+# Flamegraph
+flamegraph.pl
+
+# Certificate files
+*.crt
+*.pem
+
+# Celery
+celerybeat-schedule
+celerybeat-schedule.db
+celerybeat.pid
+
+# iRODS files
+irods_config.zip
+irods_environment.json
+
+# Vscode
+.vscode/*
+
+# Static dir for local includes in production mode
+static-local
+
+# Icons
+*/static/iconify/*.json
+*/static/iconify/json/*.json
+
+# Site template include directory
+# TODO: Remove ignore once files are moved outside of the repo in docker env
+sodar/templates/include/*
+
+# Samplesheets configuration file directory
+# TODO: Remove ignore once files are moved outside of the repo in docker env
+samplesheets/config/*

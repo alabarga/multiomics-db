@@ -1,0 +1,61 @@
+{# Projectroles dependency #}
+{% extends 'projectroles/project_base.html' %}
+{% load rules %}
+{% load samplesheets_tags %}
+
+{% block title %}
+  Confirm Sample Sheet iRODS Collections {% if update_colls %}Update{% else %}Creation{% endif %}
+{% endblock title %}
+
+{% block projectroles_extend %}
+
+<div class="container-fluid sodar-subtitle-container">
+  <h3>Confirm Sample Sheet iRODS Collections {% if update_colls %}Update{% else %}Creation{% endif %}</h3>
+</div>
+
+<div class="container-fluid sodar-page-container">
+  <div class="alert alert-warning" role="alert">
+    <strong>Warning:</strong> Are you sure you want to
+    {% if update_colls %}update the{% else %}create a{% endif %} sample data
+    collection structure in iRODS for the studies and assays under this project?
+    {% if update_colls %}
+      Existing collections will not be affected. New collections will be created
+      for studies and/or assays added in the current version of the sample sheet.
+    {% endif %}
+  </div>
+
+  {# Details #}
+  <div class="card">
+    <div class="card-header">
+      <h4>Sample Data Collection Structure</h4>
+    </div>
+    <div class="card-body">
+      {% if update_colls %}
+        <p>After the update, the collection structure will look as follows:</p>
+      {% else %}
+        <p>The following structure will be created:</p>
+      {% endif %}
+      {% autoescape off %}
+        {% get_irods_tree investigation %}
+      {% endautoescape %}
+    </div>
+  </div>
+
+  <form method="post">
+    {% csrf_token %}
+    <div class="row">
+      <div class="btn-group ml-auto">
+        <a role="button" class="btn btn-secondary"
+            href="{{ request.session.real_referer }}">
+          <i class="iconify" data-icon="mdi:arrow-left-circle"></i> Cancel
+        </a>
+       <button type="submit" class="btn btn-primary sodar-btn-submit-once">
+         <i class="iconify" data-icon="mdi:database-refresh"></i>
+         {% if update_colls %}Update{% else %}Create{% endif %}
+       </button>
+      </div>
+    </div>
+  </form>
+</div>
+
+{% endblock projectroles_extend %}

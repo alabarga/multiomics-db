@@ -1,0 +1,22 @@
+# Pro-tip: Try not to put anything here. Avoid dependencies in
+#	production that aren't in development.
+-r base.txt
+
+# LDAP requirements
+-r ldap.txt
+
+# Whitenoise for static files
+whitenoise==6.2.0
+
+# Redis cache support
+django-redis==5.2.0
+
+# WSGI Handler
+gevent==23.9.1
+gunicorn==20.1.0
+
+# Email backends for Mailgun, Postmark, SendGrid and more
+# django-anymail==7.0.0
+
+# Sentry client
+sentry-sdk==1.17.0

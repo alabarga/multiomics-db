@@ -1,0 +1,71 @@
+{% extends "projectroles/base.html" %}
+{% load rules %}
+
+{# Projectroles dependency #}
+{% load projectroles_common_tags %}
+
+{% block title %}iRODS Info{% endblock title %}
+
+{% block projectroles %}
+
+{% has_perm 'irodsinfo.get_config' request.user as can_get_config %}
+{% site_version as site_v %}
+
+<div class="row sodar-subtitle-container bg-white sticky-top">
+  <h2><i class="iconify" data-icon="mdi:lifebuoy"></i> iRODS Info</h2>
+
+  {% if can_get_config %}
+  <a role="button" class="btn btn-primary ml-auto"
+     href="{% url 'irodsinfo:config' %}">
+    <i class="iconify" data-icon="mdi:download"></i> Download Configuration
+  </a>
+  {% endif %}
+</div>
+
+<div class="container-fluid sodar-page-container">
+
+  {# Guide #}
+  <div class="alert alert-info">
+    The iRODS connecting guide has been moved into the
+    <a href="https://sodar-server.readthedocs.io/en/{% if '+' in site_v %}dev{% else %}latest{% endif %}/">
+      SODAR Manual</a>.
+  </div>
+
+  {# Server info #}
+  <div class="card">
+    <div class="card-header">
+      <h4><i class="iconify" data-icon="mdi:database"></i> iRODS Server</h4>
+    </div>
+    <div class="card-body">
+      {% if server_info %}
+        <dl class="row">
+          <dt class="col-md-2">Status</dt>
+          <dd class="col-md-10">
+            <span class="badge badge-pill badge-{% if server_info.server_ok %}success{% else %}danger{% endif %}">
+              {{ server_info.server_status }}
+            </span>
+          </dd>
+          <dt class="col-md-2">Host</dt>
+          <dd class="col-md-10">{{ server_info.server_host }}</dd>
+          <dt class="col-md-2">Port</dt>
+          <dd class="col-md-10">{{ server_info.server_port }}</dd>
+          <dt class="col-md-2">Zone</dt>
+          <dd class="col-md-10">{{ server_info.server_zone }}</dd>
+          <dt class="col-md-2">Version</dt>
+          {% if server_info.server_version %}
+            <dd class="col-md-10">{{ server_info.server_version }}</dd>
+          {% else %}
+            <dd class="col-md-10 text-muted">Unknown</dd>
+          {% endif %}
+        </dl>
+      {% elif not irods_backend_enabled %}
+        <p class="text-danger">iRODS backend not enabled!</p>
+      {% else %}
+        <p class="text-danger">Unknown error</p>
+      {% endif %}
+    </div>
+  </div>
+
+</div>
+
+{% endblock projectroles %}

@@ -1,0 +1,2043 @@
+"""Ajax API views for the samplesheets app"""
+
+import json
+import os
+
+from altamisa.constants import table_headers as th
+from datetime import datetime as dt
+from packaging import version
+
+from django.conf import settings
+from django.db import transaction
+from django.middleware.csrf import get_token
+from django.urls import reverse
+
+from rest_framework.response import Response
+
+# Projectroles dependency
+from projectroles.constants import SODAR_CONSTANTS
+from projectroles.models import Role
+from projectroles.plugins import get_backend_api
+from projectroles.views_ajax import SODARBaseProjectAjaxView
+
+# Irodsbackend dependency
+from irodsbackend.views import BaseIrodsAjaxView
+
+from samplesheets.io import SampleSheetIO
+from samplesheets.models import (
+    Investigation,
+    Study,
+    Assay,
+    Protocol,
+    Process,
+    GenericMaterial,
+    IrodsDataRequest,
+    ISATab,
+)
+from samplesheets.rendering import (
+    SampleSheetTableBuilder,
+    MODEL_JSON_ATTRS,
+)
+from samplesheets.sheet_config import SheetConfigAPI
+from samplesheets.utils import (
+    get_comments,
+    get_unique_name,
+    get_node_obj,
+    get_webdav_url,
+    get_ext_link_labels,
+)
+from samplesheets.views import (
+    IrodsDataRequestModifyMixin,
+    app_settings,
+    APP_NAME,
+    TARGET_ALTAMISA_VERSION,
+    logger,
+)
+
+
+conf_api = SheetConfigAPI()
+table_builder = SampleSheetTableBuilder()
+
+
+# SODAR constants
+PROJECT_ROLE_OWNER = SODAR_CONSTANTS['PROJECT_ROLE_OWNER']
+PROJECT_ROLE_DELEGATE = SODAR_CONSTANTS['PROJECT_ROLE_DELEGATE']
+
+# Local constants
+EDIT_FIELD_MAP = {
+    'array design ref': 'array_design_ref',
+    'label': 'extract_label',
+    'performer': 'performer',
+}
+# Approximate magic numbers for header/row height
+RENDER_HEIGHT_HEADERS = 79
+RENDER_HEIGHT_ROW = 39
+RENDER_HEIGHT_SCROLLBAR = 12
+
+ALERT_ACTIVE_REQS = (
+    'Active iRODS delete requests in this project require your attention. '
+    '<a href="{url}">See request list for details</a>.'
+)
+ALERT_LIB_FILES_EXIST = (
+    'iRODS collection exists for "{name}". Renaming may result in orphaned '
+    'files. Do you want to proceed?'
+)
+ERROR_NOT_IN_PROJECT = 'Collection does not belong to project'
+ERROR_NOT_FOUND = 'Collection not found'
+ERROR_NO_AUTH = 'User not authorized for iRODS collection'
+
+
+# Base Ajax View Classes and Mixins --------------------------------------------
+
+
+class BaseSheetEditAjaxView(SODARBaseProjectAjaxView):
+    """Base ajax view for editing sample sheet data"""
+
+    permission_required = 'samplesheets.edit_sheet'
+    ok_data = {'detail': 'ok'}
+
+    class SheetEditException(Exception):
+        pass
+
+    def _raise_ex(self, msg):
+        logger.error(msg)
+        raise self.SheetEditException(msg)
+
+    @classmethod
+    def _get_attr_value(cls, node_obj, cell, header_name, header_type):
+        """
+        Get node object attribute value in a format saveable into the database.
+
+        :param node_obj: GenericMaterial or Process object
+        :param cell: Cell update data from the client (dict)
+        :param header_name: Header name (string)
+        :param header_type: Header type (string)
+        :return: String, dict or list
+        """
+        if isinstance(cell['value'], list) and len(cell['value']) == 1:
+            val = cell['value'][0]
+        # Handle empty list
+        elif isinstance(cell['value'], list) and len(cell['value']) == 0:
+            val = None
+            if node_obj.is_ontology_field(header_name, header_type):
+                val = {
+                    'name': None,
+                    'accession': None,
+                    'ontology_name': None,
+                }
+        else:
+            val = cell['value']
+        return val
+
+    @classmethod
+    def _get_ontology_names(cls, cells=None, nodes=None):
+        """
+        Return unique ontology names from ontology field in a list of nodes.
+
+        :param cells: List of dicts
+        :param nodes: List of dicts
+        :return: List
+        """
+        if not cells and not nodes:
+            raise ValueError('Must define either cells or nodes')
+        if not cells:
+            cells = []
+            for n in nodes:
+                cells += n['cells']
+        ret = []
+        for c in cells:
+            if (
+                c.get('value')
+                and isinstance(c['value'], list)
+                and len(c['value']) > 0
+                and isinstance(c['value'][0], dict)
+            ):
+                for t in c['value']:
+                    o_name = t.get('ontology_name')
+                    if o_name and o_name not in ret:
+                        ret.append(o_name)
+        logger.debug('Ontologies in edit data: {}'.format(', '.join(ret)))
+        return ret
+
+    @classmethod
+    @transaction.atomic
+    def _update_ontology_refs(cls, investigation, edit_names):
+        """
+        Update investigation ontology refs, adding references to ontologies
+        currently missing.
+
+        :param investigation: Investigation object
+        :param edit_names: Ontology names from editing (list)
+        """
+        # TODO: Implement removal of unused ontologies (see issue #967)
+        # TODO: Update existing refs for SODAR ontology data?
+        ontology_backend = get_backend_api('ontologyaccess_backend')
+        if not ontology_backend:
+            logger.error(
+                'Ontologyaccess backend not enabled, unable to update '
+                'ontology refs'
+            )
+            return
+
+        i_names = [
+            o['name']
+            for o in investigation.ontology_source_refs
+            if o.get('name')
+        ]
+        sodar_obos = ontology_backend.get_obo_dict(key='name')
+        updated = False
+
+        for o_name in edit_names:
+            if o_name not in i_names and o_name:
+                logger.debug(
+                    'Inserting ontology reference for "{}"'.format(o_name)
+                )
+                if o_name not in sodar_obos.keys():
+                    logger.warning(
+                        'Ontology "{}" not imported to SODAR, unable to '
+                        'update ontology reference'.format(o_name)
+                    )
+                    continue
+                investigation.ontology_source_refs.append(
+                    {
+                        'file': sodar_obos[o_name]['file'],
+                        'name': o_name,
+                        'version': sodar_obos[o_name]['data_version'] or '',
+                        'description': sodar_obos[o_name]['title'],
+                        'comments': [],
+                        'headers': [
+                            'Term Source Name',
+                            'Term Source File',
+                            'Term Source Version',
+                            'Term Source Description',
+                        ],
+                    }
+                )
+                updated = True
+                logger.debug(
+                    'Inserted ontology reference for "{}" '
+                    '(investigation={})'.format(
+                        o_name, investigation.sodar_uuid
+                    )
+                )
+
+        if updated:
+            investigation.save()
+            logger.info(
+                'Ontology references updated (investigation={})'.format(
+                    investigation.sodar_uuid
+                )
+            )
+        else:
+            logger.debug(
+                'No updates for ontology references '
+                '(investigation={})'.format(investigation.sodar_uuid)
+            )
+
+
+class EditConfigMixin:
+    """Mixin class to check if user can edit column configuration"""
+
+    @classmethod
+    def can_edit_config(cls, user, project):
+        if user.is_superuser:
+            return True
+        min_role_set = app_settings.get(
+            APP_NAME, 'edit_config_min_role', project=project
+        )
+        min_role = Role.objects.filter(name=min_role_set).first()
+        if not min_role:
+            logger.error('Role "{}" not found'.format(min_role_set))
+            return False
+        if project.is_owner(user):  # Local or inherited owner
+            user_role = Role.objects.filter(
+                name=SODAR_CONSTANTS['PROJECT_ROLE_OWNER']
+            ).first()
+        else:
+            role_as = project.get_role(user)
+            if not role_as:
+                return False
+            user_role = role_as.role
+        return user_role.rank <= min_role.rank
+
+
+class SheetVersionMixin:
+    """Mixin for sheet version saving"""
+
+    @classmethod
+    def save_version(cls, investigation, request=None, description=None):
+        """
+        Save current version of an investigation as ISA-Tab into the database.
+
+        :param investigation: Investigation object
+        :param request: HTTP request or None
+        :param description: Version description (string, optional)
+        :return: ISATab object
+        :raise: Exception if ISA-Tab saving fails
+        """
+        sheet_io = SampleSheetIO()
+        project = investigation.project
+        isa_data = sheet_io.export_isa(investigation)
+        # Save sheet config with ISA-Tab version
+        isa_data['sheet_config'] = app_settings.get(
+            APP_NAME, 'sheet_config', project=project
+        )
+        isa_version = sheet_io.save_isa(
+            project=project,
+            inv_uuid=investigation.sodar_uuid,
+            isa_data=isa_data,
+            tags=['EDIT'],
+            user=request.user if request else None,
+            archive_name=investigation.archive_name,
+            description=description,
+        )
+        return isa_version
+
+
+# Ajax Views -------------------------------------------------------------------
+
+
+class SheetContextAjaxView(EditConfigMixin, SODARBaseProjectAjaxView):
+    """View to retrieve sample sheet context data"""
+
+    permission_required = 'samplesheets.view_sheet'
+
+    def get(self, request, *args, **kwargs):
+        project = self.get_project()
+        inv = Investigation.objects.filter(project=project, active=True).first()
+        studies = Study.objects.filter(investigation=inv).order_by('pk')
+        irods_backend = get_backend_api('omics_irods')
+
+        # General context data for Vue app
+        ret_data = {
+            'configuration': None,
+            'inv_file_name': None,
+            'irods_status': None,
+            'irods_backend_enabled': True if irods_backend else False,
+            'parser_version': None,
+            'parser_warnings': False,
+            'irods_webdav_enabled': settings.IRODS_WEBDAV_ENABLED,
+            'irods_webdav_url': get_webdav_url(project, request.user),
+            'external_link_labels': None,
+            'min_col_width': settings.SHEETS_MIN_COLUMN_WIDTH,
+            'max_col_width': settings.SHEETS_MAX_COLUMN_WIDTH,
+            'allow_editing': app_settings.get(
+                APP_NAME, 'allow_editing', project=project
+            ),
+            'alerts': [],
+            'csrf_token': get_token(request),
+            'investigation': {},
+            'project_uuid': str(project.sodar_uuid),
+            'user_uuid': str(request.user.sodar_uuid)
+            if hasattr(request.user, 'sodar_uuid')
+            else None,
+            'sheet_sync_enabled': app_settings.get(
+                APP_NAME, 'sheet_sync_enable', project=project
+            ),
+        }
+
+        if inv:
+            # TODO: Validate SHEETS_ONTOLOGY_URL_TEMPLATE
+            update_data = {
+                'external_link_labels': get_ext_link_labels(),
+                'ontology_url_template': settings.SHEETS_ONTOLOGY_URL_TEMPLATE,
+                'ontology_url_skip': settings.SHEETS_ONTOLOGY_URL_SKIP,
+            }
+            ret_data.update(update_data)
+            inv_data = {
+                'configuration': inv.get_configuration(),
+                'inv_file_name': inv.file_name.split('/')[-1],
+                'irods_status': inv.irods_status,
+                'irods_path': irods_backend.get_path(project)
+                if irods_backend and inv.irods_status
+                else None,
+                'parser_version': inv.parser_version or 'LEGACY',
+                'parser_warnings': True
+                if inv.parser_warnings
+                and 'use_file_names' in inv.parser_warnings
+                else False,
+                'investigation': {
+                    'identifier': inv.identifier,
+                    'title': inv.title,
+                    'description': inv.description
+                    if inv.description != project.description
+                    else None,
+                    'comments': get_comments(inv),
+                },
+            }
+            ret_data.update(inv_data)
+
+        # Parser alert
+        if inv and (
+            not inv.parser_version
+            or version.parse(inv.parser_version)
+            < version.parse(TARGET_ALTAMISA_VERSION)
+        ):
+            ret_data['alerts'].append(
+                {
+                    'level': 'danger',
+                    'html': 'This sample sheet has been imported with an '
+                    'old altamISA version (< {}). Please replace the ISA-Tab '
+                    'to enable all features and ensure full '
+                    'functionality.'.format(TARGET_ALTAMISA_VERSION),
+                }
+            )
+
+        # iRODS data request alert
+        if (
+            inv
+            and inv.irods_status
+            and (
+                self.request.user.is_superuser
+                or project.is_owner_or_delegate(self.request.user)
+            )
+        ):
+            irods_req_count = IrodsDataRequest.objects.filter(
+                project=project, status__in=['ACTIVE', 'FAILED']
+            ).count()
+            if irods_req_count > 0:
+                ret_data['alerts'].append(
+                    {
+                        'level': 'info',
+                        'html': ALERT_ACTIVE_REQS.format(
+                            url=reverse(
+                                'samplesheets:irods_requests',
+                                kwargs={'project': project.sodar_uuid},
+                            )
+                        ),
+                    }
+                )
+
+        # Study info
+        ret_data['studies'] = {}
+
+        for s in studies:
+            study_plugin = s.get_plugin()
+            ret_data['studies'][str(s.sodar_uuid)] = {
+                'display_name': s.get_display_name(),
+                'identifier': s.identifier,
+                'description': s.description,
+                'comments': get_comments(s),
+                'irods_path': irods_backend.get_path(s)
+                if irods_backend
+                else None,
+                'table_url': request.build_absolute_uri(
+                    reverse(
+                        'samplesheets:ajax_study_tables',
+                        kwargs={'study': str(s.sodar_uuid)},
+                    )
+                ),
+                'plugin': study_plugin.title if study_plugin else None,
+                'assays': {},
+            }
+
+            # Set up assay data
+            for a in s.assays.all().order_by('pk'):
+                assay_plugin = a.get_plugin()
+                ret_data['studies'][str(s.sodar_uuid)]['assays'][
+                    str(a.sodar_uuid)
+                ] = {
+                    'name': a.get_name(),
+                    'display_name': a.get_display_name(),
+                    'irods_path': irods_backend.get_path(a)
+                    if irods_backend
+                    else None,
+                    'display_row_links': assay_plugin.display_row_links
+                    if assay_plugin
+                    else True,
+                    'plugin': assay_plugin.title if assay_plugin else None,
+                }
+
+        # Permissions for UI elements (will be checked on request)
+        ret_data['perms'] = {
+            'edit_sheet': request.user.has_perm(
+                'samplesheets.edit_sheet', project
+            ),
+            'manage_sheet': request.user.has_perm(
+                'samplesheets.manage_sheet', project
+            ),
+            'create_colls': request.user.has_perm(
+                'samplesheets.create_colls', project
+            ),
+            'export_sheet': request.user.has_perm(
+                'samplesheets.export_sheet', project
+            ),
+            'delete_sheet': request.user.has_perm(
+                'samplesheets.delete_sheet', project
+            ),
+            'view_versions': request.user.has_perm(
+                'samplesheets.view_versions', project
+            ),
+            'edit_config': self.can_edit_config(request.user, project),
+            'update_cache': request.user.has_perm(
+                'samplesheets.update_cache', project
+            ),
+            'is_superuser': request.user.is_superuser,
+        }
+
+        # Statistics
+        ret_data['sheet_stats'] = (
+            {
+                'study_count': Study.objects.filter(investigation=inv).count(),
+                'assay_count': Assay.objects.filter(
+                    study__investigation=inv
+                ).count(),
+                'protocol_count': Protocol.objects.filter(
+                    study__investigation=inv
+                ).count(),
+                'process_count': Process.objects.filter(
+                    protocol__study__investigation=inv
+                ).count(),
+                'source_count': inv.get_material_count('SOURCE'),
+                'material_count': inv.get_material_count('MATERIAL'),
+                'sample_count': inv.get_material_count('SAMPLE'),
+                'data_count': inv.get_material_count('DATA'),
+            }
+            if inv
+            else {}
+        )
+
+        ret_data = json.dumps(ret_data)
+        # logger.debug('SODAR Context: {}'.format(ret_data))
+        return Response(ret_data, status=200)
+
+
+class StudyTablesAjaxView(SODARBaseProjectAjaxView):
+    """View to retrieve study tables built from the sample sheet graph"""
+
+    def _get_table_height(self, table, user, edit):
+        """
+        Return table height in pixels.
+
+        :param table: Study or assay render table
+        :param user: User object making the request
+        :param edit: Edit mode enabled (boolean)
+        :return: Integer
+        """
+        default_height = app_settings.get(
+            APP_NAME, 'sheet_table_height', user=user
+        )
+        if edit:  # When editing we always set tables to fixed user setting
+            return default_height
+        # Else limit return value to user setting
+        return min(
+            RENDER_HEIGHT_HEADERS
+            + RENDER_HEIGHT_SCROLLBAR
+            + len(table['table_data']) * RENDER_HEIGHT_ROW,
+            default_height,
+        )
+
+    def _get_display_config(self, investigation, user, sheet_config=None):
+        """Get or create display configuration for an investigation"""
+        project = investigation.project
+        user_config_found = True
+
+        # Get user display config
+        display_config = app_settings.get(
+            APP_NAME, 'display_config', project=project, user=user
+        )
+        # Get default configuration if user config is not found
+        if not display_config:
+            user_config_found = False
+            logger.debug(
+                'No display configuration found for user "{}", '
+                'using default..'.format(user.username)
+            )
+            display_config = app_settings.get(
+                APP_NAME, 'display_config_default', project=project
+            )
+
+        # If default display configuration is not found, build it
+        if not display_config:
+            logger.debug('No default display configuration found, building..')
+            inv_tables = table_builder.build_inv_tables(
+                investigation, use_config=False
+            )
+            if not sheet_config:
+                sheet_config = conf_api.get_sheet_config(
+                    investigation, inv_tables
+                )
+            display_config = conf_api.build_display_config(
+                inv_tables, sheet_config
+            )
+            logger.debug(
+                'Setting default display config for project {}'.format(
+                    project.get_log_title()
+                )
+            )
+            app_settings.set(
+                APP_NAME,
+                'display_config_default',
+                display_config,
+                project=project,
+            )
+
+        if not user_config_found:
+            logger.debug(
+                'Setting display config for user "{}" in project {} '.format(
+                    user.username, project.get_log_title()
+                )
+            )
+            app_settings.set(
+                APP_NAME,
+                'display_config',
+                display_config,
+                project=project,
+                user=user,
+            )
+        return display_config
+
+    def get_permission_required(self):
+        """Override get_permisson_required() to provide the approrpiate perm"""
+        if bool(self.request.GET.get('edit')):
+            return 'samplesheets.edit_sheet'
+        return 'samplesheets.view_sheet'
+
+    def get(self, request, *args, **kwargs):
+        from samplesheets.plugins import get_irods_content
+
+        irods_backend = get_backend_api('omics_irods')
+        study = Study.objects.filter(sodar_uuid=self.kwargs['study']).first()
+        if not study:
+            return Response(
+                {
+                    'render_error': 'Study not found with UUID "{}", '
+                    'unable to render'.format(self.kwargs['study'])
+                },
+                status=404,
+            )
+
+        inv = study.investigation
+        project = inv.project
+        # Return extra edit mode data
+        edit = bool(request.GET.get('edit'))
+        allow_editing = app_settings.get(
+            APP_NAME, 'allow_editing', project=project
+        )
+        if edit and not allow_editing:
+            return Response(
+                {
+                    'render_error': 'Editing not allowed in the project, '
+                    'unable to render'
+                },
+                status=403,
+            )
+
+        ret_data = {'study': {'display_name': study.get_display_name()}}
+        try:
+            ret_data['tables'] = table_builder.get_study_tables(study)
+        except Exception as ex:
+            # Raise if we are in debug mode
+            if settings.DEBUG:
+                raise ex
+            # TODO: Log error
+            ret_data['render_error'] = str(ex)
+            return Response(ret_data, status=200)
+
+        # Add table heights
+        ret_data['table_heights'] = {
+            'study': self._get_table_height(
+                ret_data['tables']['study'], request.user, edit
+            ),
+            'assays': {},
+        }
+        for k, v in ret_data['tables']['assays'].items():
+            ret_data['table_heights']['assays'][k] = self._get_table_height(
+                v, request.user, edit
+            )
+
+        # Get iRODS content if NOT editing and collections have been created
+        if not edit:
+            logger.debug('Retrieving iRODS content for study..')
+            ret_data = get_irods_content(inv, study, irods_backend, ret_data)
+
+        # Get/build sheet config
+        sheet_config = conf_api.get_sheet_config(inv)
+        # Get/build display config
+        if request.user and request.user.is_authenticated:
+            display_config = self._get_display_config(
+                inv, request.user, sheet_config
+            )
+            ret_data['display_config'] = display_config['studies'][
+                str(study.sodar_uuid)
+            ]
+
+        # Set up editing
+        if edit:
+            ontology_backend = get_backend_api('ontologyaccess_backend')
+            # Get study config
+            ret_data['study_config'] = sheet_config['studies'][
+                str(study.sodar_uuid)
+            ]
+            # Set up study edit context
+            ret_data['edit_context'] = {
+                'sodar_ontologies': ontology_backend.get_obo_dict(key='name')
+                if ontology_backend
+                else {},
+                'samples': {},
+                'protocols': [],
+            }
+            # Add sample info
+            s_assays = {}
+            for assay in study.assays.all().order_by('pk'):
+                a_uuid = str(assay.sodar_uuid)
+                for n in [a[0] for a in assay.arcs]:
+                    if '-sample-' in n:
+                        if n not in s_assays:
+                            s_assays[n] = []
+                        if a_uuid not in s_assays[n]:
+                            s_assays[n].append(a_uuid)
+
+            for sample in GenericMaterial.objects.filter(
+                study=study, item_type='SAMPLE'
+            ).order_by('name'):
+                ret_data['edit_context']['samples'][str(sample.sodar_uuid)] = {
+                    'name': sample.name,
+                    'assays': s_assays[sample.unique_name]
+                    if sample.unique_name in s_assays
+                    else [],
+                }
+            # Add Protocol info
+            for protocol in Protocol.objects.filter(study=study).order_by(
+                'name'
+            ):
+                ret_data['edit_context']['protocols'].append(
+                    {'uuid': str(protocol.sodar_uuid), 'name': protocol.name}
+                )
+        return Response(ret_data, status=200)
+
+
+class StudyLinksAjaxView(SODARBaseProjectAjaxView):
+    """View to retrieve data for shortcut links from study apps"""
+
+    # TODO: Also do this for assay apps?
+    permission_required = 'samplesheets.view_sheet'
+
+    def get(self, request, *args, **kwargs):
+        study = Study.objects.filter(sodar_uuid=self.kwargs['study']).first()
+        study_plugin = study.get_plugin()
+        if not study_plugin:
+            return Response(
+                {'detail': 'Plugin not found for study'}, status=404
+            )
+        ret_data = {'study': {'display_name': study.get_display_name()}}
+        try:
+            study_tables = table_builder.get_study_tables(study)
+        except Exception as ex:
+            # TODO: Log error
+            ret_data['render_error'] = str(ex)
+            return Response(ret_data, status=200)
+        ret_data = study_plugin.get_shortcut_links(
+            study, study_tables, **request.GET
+        )
+        return Response(ret_data, status=200)
+
+
+class SheetWarningsAjaxView(SODARBaseProjectAjaxView):
+    """View to retrieve parser warnings for sample sheets"""
+
+    permission_required = 'samplesheets.view_sheet'
+
+    def get(self, request, *args, **kwargs):
+        inv = Investigation.objects.filter(project=self.get_project()).first()
+        if not inv:
+            return Response(
+                {'detail': 'Investigation not found for project'}, status=404
+            )
+        logger.debug(
+            'Parser Warnings: {}'.format(json.dumps(inv.parser_warnings))
+        )
+        return Response({'warnings': inv.parser_warnings}, status=200)
+
+
+class SheetCellEditAjaxView(BaseSheetEditAjaxView):
+    """Ajax view to edit sample sheet cells"""
+
+    def _verify_update(self, node_obj, cell):
+        """
+        Verify cell update. Return None is all is OK, else return message to be
+        displayed as alert to confirm the update.
+
+        :param node_obj: GenericMaterial or Process object
+        :param cell: Cell update data from the client (dict)
+        :return: String or None
+        """
+        # TODO: Should be refactored once we support multi-cell edit here
+        # Only verify if editing material name and iRODS colls were created
+        if (
+            cell['header_type'] != 'name'
+            or cell['item_type'] not in ['SOURCE', 'SAMPLE', 'MATERIAL']
+            or not node_obj.study.investigation.irods_status
+        ):
+            return None
+        assay = node_obj.assay
+        assay_plugin = assay.get_plugin() if assay else None
+        if not assay or not assay_plugin:
+            return None
+        logger.debug(
+            'Verifying edit for node "{}" ({}): {}'.format(
+                node_obj.name, node_obj.sodar_uuid, cell
+            )
+        )
+        cache_backend = get_backend_api('sodar_cache')
+        cache_item = cache_backend.get_cache_item(
+            app_name=assay_plugin.app_name,
+            name='irods/rows/{}'.format(assay.sodar_uuid),
+            project=node_obj.get_project(),
+        )
+        if not cache_item:
+            return None
+        irods_backend = get_backend_api('omics_irods')
+        # NOTE: Can we assume all assay apps ever will follow this convention?
+        #       (At the time of implementation they do)
+        obj_path = os.path.join(irods_backend.get_path(assay), node_obj.name)
+        cache_paths = cache_item.data.get('paths')
+        if not cache_paths:  # Not sure if this can happen but just in case..
+            return None
+        path = cache_paths.get(obj_path)
+        if path and path.get('file_count') > 0:
+            # Files for material exist -> alert
+            return ALERT_LIB_FILES_EXIST.format(name=node_obj.name)
+        logger.debug('Verify OK')
+        return None
+
+    @transaction.atomic
+    def _update_cell(self, node_obj, cell, save=False):
+        """
+        Update a single cell in an object.
+
+        :param node_obj: GenericMaterial or Process object
+        :param cell: Cell update data from the client (dict)
+        :param save: If True, save object after successful call (boolean)
+        :return: String
+        :raise: SheetEditException if the operation fails.
+        """
+        ok_msg = None
+        logger.debug(
+            'Editing {} "{}" ({})'.format(
+                node_obj.__class__.__name__,
+                node_obj.unique_name,
+                node_obj.sodar_uuid,
+            )
+        )
+        # TODO: Provide the original header as one string instead
+        header_type = cell['header_type']
+        header_name = cell['header_name']
+
+        # Plain fields
+        if not header_type and header_name.lower() in EDIT_FIELD_MAP:
+            attr_name = EDIT_FIELD_MAP[header_name.lower()]
+            attr = getattr(node_obj, attr_name)
+            if isinstance(attr, str):
+                setattr(node_obj, attr_name, cell['value'])
+            elif isinstance(attr, dict):
+                attr['name'] = cell['value']
+                # TODO: Set accession and ontology once editing is allowed
+            ok_msg = 'Edited field: {}'.format(attr_name)
+
+        # Name field (special case)
+        elif header_type == 'name':
+            if len(cell['value']) == 0 and cell.get('item_type') != 'DATA':
+                self._raise_ex('Empty name not allowed for non-data node')
+            node_obj.name = cell['value']
+            # TODO: Update unique name here if needed
+            ok_msg = 'Edited node name: {}'.format(cell['value'])
+
+        # Process name and name type (special case)
+        elif header_type == 'process_name':
+            node_obj.name = cell['value']
+            if cell['header_name'] in th.PROCESS_NAME_HEADERS:
+                node_obj.name_type = cell['header_name']
+            ok_msg = 'Edited process name: {}{}'.format(
+                cell['value'],
+                ' ({})'.format(cell['header_name'])
+                if cell['header_name'] in th.PROCESS_NAME_HEADERS
+                else '',
+            )
+
+        # Protocol field (special case)
+        elif header_type == 'protocol':
+            protocol = Protocol.objects.filter(
+                sodar_uuid=cell['uuid_ref']
+            ).first()
+            if not protocol:
+                self._raise_ex(
+                    'Protocol not found: "{}" ({})'.format(
+                        cell['value'], cell['uuid_ref']
+                    )
+                )
+            node_obj.protocol = protocol
+            ok_msg = 'Edited protocol ref: "{}" ({})'.format(
+                cell['value'], cell['uuid_ref']
+            )
+
+        # Performer (special case)
+        elif header_type == 'performer':
+            node_obj.performer = cell['value']
+
+        # Perform date (special case)
+        elif header_type == 'perform_date':
+            if cell['value']:
+                try:
+                    node_obj.perform_date = dt.strptime(
+                        cell['value'], '%Y-%m-%d'
+                    )
+                except ValueError as ex:
+                    self._raise_ex(ex)
+            else:
+                node_obj.perform_date = None
+
+        # Extract label (special case)
+        elif header_type == 'extract_label':
+            node_obj.extract_label = cell['value']
+
+        # JSON Attributes
+        elif header_type in MODEL_JSON_ATTRS:
+            attr = getattr(node_obj, header_type)
+            # TODO: Is this actually a thing nowadays?
+            if isinstance(attr[header_name], str):
+                attr[header_name] = cell['value']
+            else:
+                attr[header_name]['value'] = self._get_attr_value(
+                    node_obj, cell, header_name, header_type
+                )
+                # TODO: Support ontology ref in unit
+                if node_obj.has_ontology_unit(
+                    header_name, header_type
+                ) and isinstance(attr[header_name]['unit'], dict):
+                    attr[header_name]['unit']['name'] = cell.get('unit')
+                elif node_obj.has_unit(header_name, header_type):
+                    attr[header_name]['unit'] = cell.get('unit')
+            ok_msg = 'Edited JSON attribute: {}[{}]'.format(
+                header_type, header_name
+            )
+
+        else:
+            self._raise_ex(
+                'Editing not implemented '
+                '(header_type={}; header_name={})'.format(
+                    header_type, header_name
+                )
+            )
+
+        if save:
+            node_obj.save()
+            if ok_msg:
+                logger.debug(ok_msg)
+        return ok_msg
+
+    def post(self, request, *args, **kwargs):
+        inv = Investigation.objects.filter(
+            project=self.get_project(), active=True
+        ).first()
+        updated_cells = request.data.get('updated_cells', [])
+        verify = request.data.get('verify', False)
+        studies = []
+
+        for cell in updated_cells:
+            logger.debug('Cell update: {}'.format(cell))
+            node_obj = get_node_obj(sodar_uuid=cell['uuid'])
+            # TODO: Make sure given object actually belongs in project etc.
+            if not node_obj:
+                err_msg = 'Object not found: {} ({})'.format(
+                    cell['uuid'], cell['obj_cls']
+                )
+                logger.error(err_msg)
+                # TODO: Return list of errors when processing in batch
+                return Response({'detail': err_msg}, status=500)
+
+            # Verify cell edit
+            if verify:
+                alert = self._verify_update(node_obj, cell)
+                if alert:
+                    logger.info(
+                        'Verify returned alert for cell: {}'.format(cell)
+                    )
+                    logger.info('Alert: {}'.format(alert))
+                    return Response(
+                        {'detail': 'alert', 'alert_msg': alert}, status=200
+                    )
+
+            # Update cell, save immediately (now we are only editing one cell)
+            try:
+                self._update_cell(node_obj, cell, save=True)
+                # Add node study for study table cache clearing
+                study = node_obj.get_study()
+                if study not in studies:
+                    studies.append(study)
+            except self.SheetEditException as ex:
+                return Response({'detail': str(ex)}, status=500)
+
+        # Update investigation ontology refs
+        if updated_cells:
+            try:
+                self._update_ontology_refs(
+                    inv, self._get_ontology_names(cells=updated_cells)
+                )
+            except Exception as ex:
+                return Response({'detail': str(ex)}, status=500)
+            # Clear cached study tables
+            for study in studies:
+                table_builder.clear_study_cache(study)
+        # TODO: Log edits in timeline here, once saving in bulk
+        return Response(self.ok_data, status=200)
+
+
+class SheetRowInsertAjaxView(BaseSheetEditAjaxView):
+    """Ajax view for inserting rows into sample sheets"""
+
+    @classmethod
+    def _get_name(cls, node):
+        """
+        Return non-unique name for a node retrieved from the editor for a new
+        row, or None if the name does not exist.
+
+        :param node: Dict
+        :return: String or None
+        """
+        if node['cells'][0]['obj_cls'] == 'Process':
+            for cell in node['cells']:
+                if cell.get('header_type') == 'process_name':
+                    return cell['value']
+        else:  # Material
+            return node['cells'][0]['value']
+        return None
+
+    @classmethod
+    def _add_node_attr(cls, node_obj, cell):
+        """
+        Add common node attribute from cell in a new row node.
+
+        :param node_obj: GenericMaterial or Process
+        :param cell: Dict
+        """
+        header_name = cell['header_name']
+        header_type = cell['header_type']
+
+        if header_type in MODEL_JSON_ATTRS:
+            attr = getattr(node_obj, header_type)
+            # Check if we have ontology refs and alter value
+            attr[header_name] = {
+                'value': cls._get_attr_value(
+                    node_obj, cell, header_name, header_type
+                )
+            }
+            # TODO: Support ontology ref in unit for real
+            if node_obj.has_ontology_unit(header_name, header_type):
+                attr[header_name]['unit'] = {
+                    'name': cell.get('unit'),
+                    'ontology_name': None,
+                    'accession': None,
+                }
+            elif (
+                node_obj.has_unit(header_name, header_type)
+                and cell.get('unit') != ''
+            ):
+                attr[header_name]['unit'] = cell.get('unit')
+            else:
+                attr[header_name]['unit'] = None
+            logger.debug(
+                'Set {}: {} = {}'.format(
+                    header_type, header_name, attr[header_name]
+                )
+            )
+
+        elif header_type == 'performer' and cell['value']:
+            node_obj.performer = cell['value']
+            logger.debug('Set performer: {}'.format(node_obj.performer))
+
+        elif header_type == 'perform_date' and cell['value']:
+            node_obj.perform_date = dt.strptime(cell['value'], '%Y-%m-%d')
+            logger.debug('Set perform date: {}'.format(cell['value']))
+
+        elif header_type == 'extract_label':
+            node_obj.extract_label = cell['value']
+
+    @classmethod
+    def _collapse_process(cls, row_nodes, node, node_idx, comp_table, node_obj):
+        """
+        Collapse process into an existing one.
+
+        :param row_nodes: List of dicts from editor UI
+        :param node: Dict from editor UI
+        :param comp_table: Study/assay table generated by
+                           SampleSheetTableBuilder (dict)
+        :param node_obj: Unsaved Process object
+        :return: UUID of collapsed process (String or None)
+        """
+        # First get the UUIDs of existing nodes in the current row
+        prev_new_uuid = None
+        next_new_uuid = None
+        iter_idx = 0
+
+        while iter_idx < node_idx:
+            if cls._get_name(row_nodes[iter_idx]):
+                prev_new_uuid = row_nodes[iter_idx]['cells'][0].get('uuid')
+            iter_idx += 1
+        if not prev_new_uuid:
+            logger.debug(
+                'Collapse: Previous named node in current row not found'
+            )
+            return None
+        iter_idx = node_idx + 1
+        while not next_new_uuid and iter_idx < len(row_nodes):
+            if cls._get_name(row_nodes[iter_idx]):
+                next_new_uuid = row_nodes[iter_idx]['cells'][0].get('uuid')
+            iter_idx += 1
+        if not next_new_uuid:
+            logger.debug('Collapse: Next named node in current row not found')
+            return None
+
+        # HACK: Get actual cell index
+        col_idx = int(node['cells'][0]['header_field'][3:])
+        for comp_row in comp_table['table_data']:
+            iter_idx = 0
+            same_protocol = False
+            prev_old_uuid = None
+            prev_old_name = None
+            next_old_uuid = None
+            # TODO: Can we trust that the protocol always comes first in node?
+            if (
+                not node_obj.protocol
+                or comp_row[col_idx]['value'] == node_obj.protocol.name
+            ):
+                same_protocol = True
+
+            while iter_idx < col_idx:
+                if (
+                    comp_table['field_header'][iter_idx]['type']
+                    in ['name', 'process_name']
+                    and comp_row[iter_idx]['value']
+                ):
+                    prev_old_uuid = comp_row[iter_idx]['uuid']
+                    prev_old_name = comp_row[iter_idx]['value']
+                iter_idx += 1
+
+            if prev_old_uuid:
+                logger.debug(
+                    'Collapse: Found previous named node "{}" (UUID={})'.format(
+                        prev_old_name, prev_old_uuid
+                    )
+                )
+                iter_idx = col_idx + 1
+                while not next_old_uuid and iter_idx < len(comp_row):
+                    if (
+                        comp_table['field_header'][iter_idx]['type']
+                        in ['name', 'process_name']
+                        and comp_row[iter_idx]['uuid']
+                        != comp_row[col_idx]['uuid']
+                        and comp_row[iter_idx]['value']
+                    ):
+                        next_old_uuid = comp_row[iter_idx]['uuid']
+                        logger.debug(
+                            'Collapse: Found next named node "{}" '
+                            '(UUID={})'.format(
+                                comp_row[iter_idx]['value'], next_old_uuid
+                            )
+                        )
+                        break
+                    iter_idx += 1
+
+            if (
+                prev_old_uuid
+                and next_old_uuid
+                and same_protocol
+                and (prev_old_uuid == prev_new_uuid)
+                and (next_old_uuid == next_new_uuid)
+            ):
+                logger.debug('Collapse: Comparing process objects..')
+                collapse_uuid = comp_row[col_idx]['uuid']
+                comp_obj = Process.objects.get(sodar_uuid=collapse_uuid)
+                # Compare parameters
+                # TODO: Compare other fields once supported
+                if node_obj.parameter_values != comp_obj.parameter_values:
+                    logger.debug('Collapse: Parameter values do not match')
+                elif node_obj.performer != comp_obj.performer:
+                    logger.debug('Collapse: Performer does not match')
+                elif node_obj.perform_date != comp_obj.perform_date:
+                    logger.debug('Collapse: Perform date does not match')
+                else:
+                    logger.debug('Collapse: Match found')
+                    return collapse_uuid
+            logger.debug('Collapse: Identical process not found')
+
+    @transaction.atomic
+    def _insert_row(self, row):
+        """
+        Insert row into a sample sheet.
+
+        :param row: Dict from the UI
+        :raise: SheetEditException if the operation fails.
+        """
+        sheet_io = SampleSheetIO()
+        study = Study.objects.filter(sodar_uuid=row['study']).first()
+        assay = None
+        row_arcs = []
+        parent = study
+        if row['assay']:
+            assay = Assay.objects.filter(sodar_uuid=row['assay']).first()
+            parent = assay
+        node_objects = []
+        node_count = 0
+        obj_kwargs = {}
+        collapse = False
+        comp_table = None
+        logger.debug(
+            'Inserting row in {} "{}" ({})'.format(
+                parent.__class__.__name__,
+                parent.get_display_name(),
+                parent.sodar_uuid,
+            )
+        )
+
+        # TODO: We create duplicate rows with named processes, fix!
+
+        # Check if we'll need to consider collapsing of unnamed nodes
+        # (References to existing nodes with UUID will not have to be collapsed)
+        if [
+            n
+            for n in row['nodes']
+            if not n['cells'][0].get('uuid') and not self._get_name(n)
+        ]:
+            logger.debug('Unnamed node(s) in row, will attempt collapsing')
+            collapse = True
+            try:
+                comp_study = table_builder.get_study_tables(
+                    Study.objects.filter(sodar_uuid=row['study']).first()
+                )
+            except Exception as ex:
+                self._raise_ex(
+                    'Error building tables for collapsing: {}'.format(ex)
+                )
+            if not assay:
+                comp_table = comp_study['study']
+            else:
+                comp_table = comp_study['assays'][str(assay.sodar_uuid)]
+
+        # Retrieve/build row nodes
+        for node in row['nodes']:
+            # logger.debug('Node headers: {}'.format(node['headers']))  # DEBUG
+            name = self._get_name(node)
+            new_node = True
+            node_obj = None
+            obj_cls = node['cells'][0]['obj_cls']
+            uuid = node['cells'][0].get('uuid')
+
+            # Existing Node
+            if uuid:
+                # Could also use eval() but it's unsafe
+                node_obj = get_node_obj(sodar_uuid=uuid)
+                if not node_obj:
+                    self._raise_ex(
+                        '{} not found (UUID={})'.format(obj_cls, uuid)
+                    )
+            # Named process is a special case
+            # TODO: Also check column!
+            elif obj_cls == 'Process' and name:
+                node_obj = Process.objects.filter(
+                    study=study, assay=assay, name=name
+                ).first()
+            if node_obj:
+                new_node = False
+                logger.debug(
+                    'Node {}: Existing {} {}'.format(
+                        node_count,
+                        node_obj.__class__.__name__,
+                        node_obj.sodar_uuid,
+                    )
+                )
+
+            # New Process
+            if not node_obj and obj_cls == 'Process':
+                protocol = None
+                unique_name = (
+                    get_unique_name(study, assay, name) if name else None
+                )
+                # TODO: Can we trust that the protocol always comes first?
+                if node['cells'][0]['header_type'] == 'protocol':
+                    protocol = Protocol.objects.filter(
+                        sodar_uuid=node['cells'][0]['uuid_ref']
+                    ).first()
+                    if not protocol:
+                        self._raise_ex(
+                            'Protocol not found with UUID={}'.format(
+                                node['cells'][0]['uuid_ref']
+                            )
+                        )
+                    unique_name = get_unique_name(study, assay, protocol.name)
+                if not name and not protocol:
+                    self._raise_ex(
+                        'Protocol and name both missing from process'
+                    )
+
+                # NOTE: We create the object in memory regardless of collapse
+                obj_kwargs = {
+                    'name': name,
+                    'unique_name': unique_name,
+                    'name_type': None,
+                    'protocol': protocol,
+                    'study': study,
+                    'assay': assay,
+                    'performer': '' if 'Performer' in node['headers'] else None,
+                    'perform_date': None,
+                    'headers': node['headers'],
+                }
+                # Add name_type if found in headers
+                for h in node['headers']:
+                    if h in th.PROCESS_NAME_HEADERS:
+                        obj_kwargs['name_type'] = h
+                        break
+                # TODO: array_design_ref
+                # TODO: first_dimension
+                # TODO: second_dimension
+                node_obj = Process(**obj_kwargs)
+
+            # New Material
+            elif not node_obj and obj_cls == 'GenericMaterial':
+                name_id = node['cells'][0]['value']
+                if not name_id:
+                    name_id = node['headers'][0]
+                obj_kwargs = {
+                    'item_type': node['cells'][0]['item_type'],
+                    'name': node['cells'][0]['value'],
+                    'unique_name': get_unique_name(
+                        study,
+                        assay,
+                        name_id,
+                        node['cells'][0]['item_type'],
+                    ),
+                    'study': study,
+                    'assay': assay,
+                    'material_type': node['headers'][0],
+                    'factor_values': {},
+                    'headers': node['headers'],
+                }
+                # TODO: extra_material_type
+                # TODO: extract_label
+                # TODO: alt_names
+                node_obj = GenericMaterial(**obj_kwargs)
+
+            # Fill New Node / Collapse Process
+            if new_node:
+                # Add common attributes
+                for cell in node['cells'][1:]:
+                    self._add_node_attr(node_obj, cell)
+                collapse_uuid = None
+                if (
+                    node_obj.__class__ == Process
+                    and not node_obj.name
+                    and collapse
+                    and node_count > 0
+                ):
+                    logger.debug('Unnamed process, attempting to collapse..')
+                    collapse_uuid = self._collapse_process(
+                        row['nodes'], node, node_count, comp_table, node_obj
+                    )
+                if collapse_uuid:  # Collapse successful
+                    node_obj = Process.objects.get(sodar_uuid=collapse_uuid)
+                    logger.debug(
+                        'Node {}: Collapsed with existing {} {}'.format(
+                            node_count,
+                            node_obj.__class__.__name__,
+                            node_obj.sodar_uuid,
+                        )
+                    )
+                else:
+                    node_obj.save()
+                    logger.debug(
+                        'Node {}: Created {} {}: {}'.format(
+                            node_count,
+                            node_obj.__class__.__name__,
+                            node_obj.sodar_uuid,
+                            obj_kwargs,
+                        )
+                    )
+            node_objects.append(node_obj)
+            node_count += 1
+
+        # Build arcs
+        for i in range(0, len(node_objects) - 1):
+            row_arcs.append(
+                [node_objects[i].unique_name, node_objects[i + 1].unique_name]
+            )
+        logger.debug('Row Arcs: {}'.format(row_arcs))
+        # Add new arcs to parent
+        for a in row_arcs:
+            if a not in parent.arcs:
+                parent.arcs.append(a)
+        parent.save()
+
+        # Attempt to export investigation with altamISA
+        try:
+            sheet_io.export_isa(study.investigation)
+        except Exception as ex:
+            self._raise_ex('altamISA Error: {}'.format(ex))
+        logger.debug('Inserting row OK')
+        # Clear cached study tables
+        table_builder.clear_study_cache(study)
+        # Return node UUIDs if successful
+        return [str(o.sodar_uuid) for o in node_objects]
+
+    def post(self, request, *args, **kwargs):
+        inv = Investigation.objects.filter(
+            project=self.get_project(), active=True
+        ).first()
+        new_row = request.data.get('new_row', None)
+        if new_row:
+            logger.debug('Row insert: {}'.format(json.dumps(new_row)))
+            try:
+                self.ok_data['node_uuids'] = self._insert_row(new_row)
+                logger.debug('node_uuids={}'.format(self.ok_data['node_uuids']))
+                # Update investigation ontology refs
+                try:
+                    self._update_ontology_refs(
+                        inv, self._get_ontology_names(nodes=new_row['nodes'])
+                    )
+                except Exception as ex:
+                    return Response({'detail': str(ex)}, status=500)
+            except Exception as ex:
+                if settings.DEBUG:
+                    raise (ex)
+                return Response({'detail': str(ex)}, status=500)
+        return Response(self.ok_data, status=200)
+
+
+class SheetRowDeleteAjaxView(BaseSheetEditAjaxView):
+    """Ajax view for deleting rows from sample sheets"""
+
+    def _delete_node(self, node):
+        """
+        Delete node object from the database.
+
+        :param node: Dict
+        """
+        if node['obj'].id:  # It's possible we already deleted this
+            logger.debug(
+                'Deleting node: {} {} (UUID={})'.format(
+                    node['obj'].__class__.__name__,
+                    node['unique_name'],
+                    node['uuid'],
+                )
+            )
+            node['obj'].delete()
+
+    @transaction.atomic
+    def _delete_row(self, row):
+        """
+        Delete row from a study/assay table. Also delete node objects from the
+        database if unused after the row deletion.
+
+        :param row: Dict from the UI
+        :raise: SheetEditException if the operation fails.
+        """
+        sheet_io = SampleSheetIO()
+        study = Study.objects.filter(sodar_uuid=row['study']).first()
+        parent = study
+        ui_nodes = row['nodes']
+        sample_obj = None
+
+        for node in ui_nodes:
+            if node['obj_cls'] == 'GenericMaterial':
+                node_obj = GenericMaterial.objects.filter(
+                    sodar_uuid=node['uuid']
+                ).first()
+            else:
+                node_obj = Process.objects.filter(
+                    sodar_uuid=node['uuid']
+                ).first()
+            if not node_obj:
+                self._raise_ex(
+                    '{} not found (UUID={})'.format(
+                        node['obj_cls'], node['uuid']
+                    )
+                )
+            node['obj'] = node_obj
+            node['unique_name'] = node_obj.unique_name
+            if (
+                node_obj.__class__ == GenericMaterial
+                and node_obj.item_type == 'SAMPLE'
+            ):
+                sample_obj = node_obj
+
+        if row['assay']:
+            assay = Assay.objects.filter(sodar_uuid=row['assay']).first()
+            parent = assay
+        # Check for invalid deletion attempts we can detect at this point
+        if parent == study:
+            for s_assay in study.assays.all():
+                if sample_obj.unique_name in [a[0] for a in s_assay.arcs]:
+                    self._raise_ex(
+                        'Sample used in assay(s), can not delete row from study'
+                    )
+        logger.debug(
+            'Deleting row from {} "{}" ({})'.format(
+                parent.__class__.__name__,
+                parent.get_display_name(),
+                parent.sodar_uuid,
+            )
+        )
+
+        # Build reference table
+        ref_study = Study.objects.get(sodar_uuid=row['study'])  # See issue #902
+        study_nodes = ref_study.get_nodes()
+        all_refs = table_builder.build_study_reference(ref_study, study_nodes)
+        sample_idx = table_builder.get_sample_idx(all_refs)
+        arc_del_count = 0
+
+        if parent == study:
+            table_refs = table_builder.get_study_refs(all_refs, sample_idx)
+        else:
+            assay_id = 0
+            for a in study.assays.all().order_by('pk'):
+                if parent == a:
+                    break
+                assay_id += 1
+            table_refs = table_builder.get_assay_refs(
+                all_refs, assay_id, sample_idx, study_cols=False
+            )
+            sample_idx = 0  # Set to 0 for further checks against the table
+
+        for i in range(1, len(ui_nodes)):
+            arc_count = 0
+            node1_name = ui_nodes[i - 1]['unique_name']
+            node2_name = ui_nodes[i]['unique_name']
+            node1_count = 0
+            node2_count = 0
+
+            for ref_row in table_refs:
+                if ref_row[i - 1] == node1_name and ref_row[i] == node2_name:
+                    arc_count += 1
+                if ref_row[i - 1] == node1_name:
+                    node1_count += 1
+                if ref_row[i] == node2_name:
+                    node2_count += 1
+
+            if arc_count == 1:
+                logger.debug(
+                    'Deleting arc: {} / {}'.format(node1_name, node2_name)
+                )
+                parent.arcs.remove([node1_name, node2_name])
+                parent.save()
+                if node1_count == 1 and (
+                    parent == study or i - 1 != sample_idx
+                ):
+                    self._delete_node(ui_nodes[i - 1])
+                if node2_count == 1 and (
+                    parent == study or i - 1 != sample_idx
+                ):
+                    self._delete_node(ui_nodes[i])
+                arc_del_count += 1
+
+        if arc_del_count == 0:
+            self._raise_ex('Did not find arcs to remove')
+        study.investigation.save()
+
+        # Attempt to export investigation with altamISA
+        try:
+            sheet_io.export_isa(study.investigation)
+        except Exception as ex:
+            self._raise_ex('altamISA Error: {}'.format(ex))
+        # Clear cached study tables
+        table_builder.clear_study_cache(study)
+        logger.debug('Deleting row OK')
+
+    def post(self, request, *args, **kwargs):
+        del_row = request.data.get('del_row', None)
+        if del_row:
+            logger.debug('Row delete: {}'.format(json.dumps(del_row)))
+            try:
+                self._delete_row(del_row)
+            except self.SheetEditException as ex:
+                return Response({'detail': str(ex)}, status=500)
+        return Response(self.ok_data, status=200)
+
+
+class SheetVersionSaveAjaxView(SheetVersionMixin, SODARBaseProjectAjaxView):
+    """Ajax view for saving current sample sheet version as ISATab backup"""
+
+    permission_required = 'samplesheets.edit_sheet'
+
+    def post(self, request, *args, **kwargs):
+        timeline = get_backend_api('timeline_backend')
+        log_msg = 'Save sheet version: '
+        isa_version = None
+        project = self.get_project()
+        inv = Investigation.objects.filter(project=project, active=True).first()
+        export_ex = None
+
+        try:
+            isa_version = self.save_version(
+                inv, request, request.data.get('description') or None
+            )
+        except Exception as ex:
+            logger.error(
+                log_msg + 'Unable to export sheet to ISA-Tab: {}'.format(ex)
+            )
+            export_ex = str(ex)
+
+        if timeline:
+            tl_status = 'FAILED' if export_ex else 'OK'
+            tl_desc = 'save sheet version'
+            if not export_ex and isa_version:
+                tl_desc += ' as {isatab}'
+            tl_event = timeline.add_event(
+                project=project,
+                app_name=APP_NAME,
+                user=request.user,
+                event_name='sheet_version_save',
+                description=tl_desc,
+                status_type=tl_status,
+                status_desc=export_ex if tl_status == 'FAILED' else None,
+            )
+            if not export_ex and isa_version:
+                tl_event.add_object(
+                    obj=isa_version,
+                    label='isatab',
+                    name=isa_version.get_full_name(),
+                )
+
+        if not export_ex and isa_version:
+            return Response({'detail': 'ok'}, status=200)
+        return Response({'detail': export_ex}, status=500)
+
+
+class SheetEditFinishAjaxView(SheetVersionMixin, SODARBaseProjectAjaxView):
+    """
+    View for finishing editing and saving an ISA-Tab copy of the current
+    sample sheet.
+    """
+
+    permission_required = 'samplesheets.edit_sheet'
+
+    def post(self, request, *args, **kwargs):
+        log_msg = 'Finish editing: '
+        updated = request.data.get('updated')
+        if not updated:
+            logger.info(log_msg + 'nothing updated')
+            return Response({'detail': 'ok'}, status=200)  # Nothing to do
+
+        timeline = get_backend_api('timeline_backend')
+        isa_version = None
+        project = self.get_project()
+        inv = Investigation.objects.filter(project=project, active=True).first()
+        export_ex = None
+
+        if not request.data.get('version_saved'):
+            try:
+                isa_version = self.save_version(inv, request)
+            except Exception as ex:
+                logger.error(
+                    log_msg + 'Unable to export sheet to ISA-Tab: {}'.format(ex)
+                )
+                export_ex = str(ex)
+
+        if timeline:
+            tl_status = 'FAILED' if export_ex else 'OK'
+            tl_desc = 'finish editing sheets'
+            if not export_ex and isa_version:
+                tl_desc += ' and save version as {isatab}'
+            tl_event = timeline.add_event(
+                project=project,
+                app_name=APP_NAME,
+                user=request.user,
+                event_name='sheet_edit_finish',
+                description=tl_desc,
+                status_type=tl_status,
+                status_desc=export_ex if tl_status == 'FAILED' else None,
+            )
+            if not export_ex and isa_version:
+                tl_event.add_object(
+                    obj=isa_version,
+                    label='isatab',
+                    name=isa_version.get_full_name(),
+                )
+
+        if not export_ex:
+            if isa_version:
+                logger.info(
+                    log_msg
+                    + 'Saved ISA-Tab "{}"'.format(isa_version.get_full_name())
+                )
+            inv.save()  # Update date_modified
+            return Response({'detail': 'ok'}, status=200)
+        return Response({'detail': export_ex}, status=500)
+
+
+class SheetEditConfigAjaxView(EditConfigMixin, SODARBaseProjectAjaxView):
+    """View to update sample sheet editing configuration"""
+
+    # NOTE: Currently not requiring manage_sheet perm (see issue #880)
+    permission_required = 'samplesheets.edit_sheet'
+
+    # TODO: Add node name for logging/timeline
+    def post(self, request, *args, **kwargs):
+        fields = request.data.get('fields')
+        if not fields:
+            return Response({'detail': 'No fields provided'}, status=400)
+        timeline = get_backend_api('timeline_backend')
+        project = self.get_project()
+        sheet_config = app_settings.get(
+            APP_NAME, 'sheet_config', project=project
+        )
+        if not self.can_edit_config(request.user, project):
+            return Response(
+                {'detail': 'User not allowed to modify column config'},
+                status=403,
+            )
+        studies = []
+
+        for field in fields:
+            logger.debug('Field config: {}'.format(field))
+            s_uuid = field['study']
+            a_uuid = field['assay']
+            n_idx = field['node_idx']
+            f_idx = field['field_idx']
+            is_name = True if field['config']['name'] == 'Name' else False
+            debug_info = 'study="{}"; assay="{}"; n={}; f={})'.format(
+                s_uuid, a_uuid, n_idx, f_idx
+            )
+            study = Study.objects.filter(sodar_uuid=field['study']).first()
+            if study not in studies:
+                studies.append(study)
+
+            try:
+                if a_uuid:
+                    og_config = sheet_config['studies'][s_uuid]['assays'][
+                        a_uuid
+                    ]['nodes'][n_idx]['fields'][f_idx]
+                else:
+                    og_config = sheet_config['studies'][s_uuid]['nodes'][n_idx][
+                        'fields'
+                    ][f_idx]
+            except Exception as ex:
+                msg = 'Unable to access config field ({}): {}'.format(
+                    debug_info, ex
+                )
+                logger.error(msg)
+                return Response({'detail': msg}, status=500)
+
+            if not is_name and (
+                field['config']['name'] != og_config['name']
+                or (
+                    og_config.get('type')
+                    and field['config']['type'] != og_config['type']
+                )
+            ):
+                msg = 'Fields do not match ({})'.format(debug_info)
+                logger.error(msg)
+                return Response({'detail': msg}, status=500)
+
+            # Cleanup data
+            c = field['config']
+            if not is_name:
+                if c['format'] != 'integer':
+                    c.pop('range', None)
+                    c.pop('unit', None)
+                    c.pop('unit_default', None)
+                elif 'range' in c and not c['range'][0] and not c['range'][1]:
+                    c.pop('range', None)
+                if c['format'] in ['protocol', 'select']:
+                    c.pop('regex', None)
+                if c['format'] != 'select':
+                    c.pop('options', None)
+            if a_uuid:
+                sheet_config['studies'][s_uuid]['assays'][a_uuid]['nodes'][
+                    n_idx
+                ]['fields'][f_idx] = c
+            else:
+                sheet_config['studies'][s_uuid]['nodes'][n_idx]['fields'][
+                    f_idx
+                ] = c
+
+            app_settings.set(
+                APP_NAME, 'sheet_config', sheet_config, project=project
+            )
+            logger.info(
+                'Updated field config for "{}" ({}) in {} {}'.format(
+                    c['name'],
+                    'name' if is_name else c.get('type'),
+                    'assay' if a_uuid else 'study',
+                    a_uuid if a_uuid else s_uuid,
+                )
+            )
+            # TODO: Update default display config (and user configurations?)
+
+            if timeline:
+                if a_uuid:
+                    tl_obj = Assay.objects.filter(sodar_uuid=a_uuid).first()
+                else:
+                    tl_obj = Study.objects.filter(sodar_uuid=s_uuid).first()
+                tl_label = tl_obj.__class__.__name__.lower()
+                tl_event = timeline.add_event(
+                    project=project,
+                    app_name=APP_NAME,
+                    user=request.user,
+                    event_name='field_update',
+                    description='update field configuration for "{}" '
+                    'in {{{}}}'.format(c['name'].title(), tl_label),
+                    status_type='OK',
+                    extra_data={'config': c},
+                )
+                tl_event.add_object(
+                    obj=tl_obj, label=tl_label, name=tl_obj.get_display_name()
+                )
+        # TODO: Update investigation ontology reference, return list
+        # Clear cached study tables
+        for study in studies:
+            table_builder.clear_study_cache(study)
+        return Response({'detail': 'ok'}, status=200)
+
+
+class StudyDisplayConfigAjaxView(SODARBaseProjectAjaxView):
+    """View to update sample sheet display configuration for a study"""
+
+    permission_required = 'samplesheets.view_sheet'
+
+    def post(self, request, *args, **kwargs):
+        study_config = request.data.get('study_config')
+        if not study_config:
+            return Response(
+                {'detail': 'No study configuration provided'}, status=400
+            )
+        study_uuid = self.kwargs.get('study')
+        study = Study.objects.filter(sodar_uuid=study_uuid).first()
+        if not study:
+            return Response({'detail': 'Study not found'}, status=404)
+
+        timeline = get_backend_api('timeline_backend')
+        project = study.investigation.project
+        # Set current configuration as default if selected
+        set_default = request.data.get('set_default')
+        ret_default = False
+
+        if set_default:
+            default_config = app_settings.get(
+                APP_NAME, 'display_config_default', project=project
+            )
+            default_config['studies'][study_uuid] = study_config
+            ret_default = app_settings.set(
+                APP_NAME,
+                'display_config_default',
+                project=project,
+                value=default_config,
+            )
+            if timeline and ret_default:
+                tl_event = timeline.add_event(
+                    project=project,
+                    app_name=APP_NAME,
+                    user=request.user,
+                    event_name='display_update',
+                    description='update default column display configuration '
+                    'for {study}',
+                    status_type='OK',
+                )
+                tl_event.add_object(
+                    obj=study, label='study', name=study.get_display_name()
+                )
+
+        # Get user display config
+        display_config = app_settings.get(
+            APP_NAME, 'display_config', project=project, user=request.user
+        )
+        display_config['studies'][study_uuid] = study_config
+        ret = app_settings.set(
+            APP_NAME,
+            'display_config',
+            project=project,
+            user=request.user,
+            value=display_config,
+        )
+        return Response(
+            {'detail': 'ok' if ret or ret_default else 'Nothing to update'},
+            status=200,
+        )
+
+
+class IrodsDataRequestCreateAjaxView(
+    IrodsDataRequestModifyMixin, SODARBaseProjectAjaxView
+):
+    """Ajax view for creating an iRODS data request"""
+
+    permission_required = 'samplesheets.edit_sheet'
+
+    def post(self, request, *args, **kwargs):
+        irods_backend = get_backend_api('omics_irods')
+        path = irods_backend.sanitize_path(request.data.get('path'))
+        project = self.get_project()
+
+        # Create database object
+        old_request = IrodsDataRequest.objects.filter(
+            path=path, status__in=['ACTIVE', 'FAILED']
+        ).first()
+        if old_request:
+            return Response(
+                {'detail': 'active request for path already exists'}, status=400
+            )
+        irods_request = IrodsDataRequest.objects.create(
+            path=path,
+            user=request.user,
+            project=project,
+            description='Request created in iRODS file list',
+        )
+
+        # Create timeline event
+        self.add_tl_event(irods_request, 'create')
+        # Add app alerts to owners/delegates
+        self.add_alerts_create(project)
+        return Response(
+            {
+                'detail': 'ok',
+                'status': irods_request.status,
+                'user': str(request.user.sodar_uuid),
+            },
+            status=200,
+        )
+
+
+class IrodsDataRequestDeleteAjaxView(
+    IrodsDataRequestModifyMixin, SODARBaseProjectAjaxView
+):
+    """Ajax view for deleting an iRODS data request"""
+
+    permission_required = 'samplesheets.edit_sheet'
+
+    def post(self, request, *args, **kwargs):
+        irods_backend = get_backend_api('omics_irods')
+        path = irods_backend.sanitize_path(request.data.get('path'))
+        # Delete database object
+        irods_request = IrodsDataRequest.objects.filter(
+            path=path,
+            status__in=['ACTIVE', 'FAILED'],
+        ).first()
+        if not irods_request:
+            return Response({'detail': 'Request not found'}, status=404)
+        if not (
+            request.user.is_superuser or request.user == irods_request.user
+        ):
+            return Response(
+                {'detail': 'User not allowed to delete request'}, status=403
+            )
+
+        # Add timeline event
+        self.add_tl_event(irods_request, 'delete')
+        # Handle project alerts
+        self.handle_alerts_deactivate(irods_request)
+        irods_request.delete()
+        return Response(
+            {'detail': 'ok', 'status': None, 'user': None},
+            status=200,
+        )
+
+
+class IrodsObjectListAjaxView(BaseIrodsAjaxView):
+    """View for listing data objects in iRODS recursively"""
+
+    permission_required = 'samplesheets.view_sheet'
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.project = None
+        self.path = None
+
+    def get(self, request, *args, **kwargs):
+        irods_backend = get_backend_api('omics_irods')
+        if not irods_backend:
+            return Response({'detail': 'iRODS backend not enabled'}, status=400)
+        # Get files
+        try:
+            with irods_backend.get_session() as irods:
+                obj_list = irods_backend.get_objects(irods, self.path)
+        except Exception as ex:
+            return Response({'detail': str(ex)}, status=400)
+        for o in obj_list:
+            db_obj = IrodsDataRequest.objects.filter(
+                path=o['path'], status__in=['ACTIVE', 'FAILED']
+            ).first()
+            o['irods_request_status'] = db_obj.status if db_obj else None
+            o['irods_request_user'] = (
+                str(db_obj.user.sodar_uuid) if db_obj else None
+            )
+        return Response({'irods_data': obj_list}, status=200)
+
+
+class SheetVersionCompareAjaxView(SODARBaseProjectAjaxView):
+    """View for listing data objects in iRODS recursively"""
+
+    permission_required = 'samplesheets.view_sheet'
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.project = None
+
+    def get(self, request, *args, **kwargs):
+        category = request.GET.get('category')
+        filename = request.GET.get('filename')
+        try:
+            source = ISATab.objects.get(sodar_uuid=request.GET.get('source'))
+            target = ISATab.objects.get(sodar_uuid=request.GET.get('target'))
+        except ISATab.DoesNotExist:
+            return Response(
+                {'detail': 'Sample sheet version(s) not found.'}, status=500
+            )
+
+        ret_data = {}
+        # If category and filename are given, only return diff data for one file
+        if category and filename:
+            ret_data = [
+                [
+                    line.split('\t')
+                    for line in source.data.get(category, {})
+                    .get(filename, {})
+                    .get('tsv', '')
+                    .replace('"', '')
+                    .split('\n')
+                ],
+                [
+                    line.split('\t')
+                    for line in target.data.get(category, {})
+                    .get(filename, {})
+                    .get('tsv', '')
+                    .replace('"', '')
+                    .split('\n')
+                ],
+            ]
+            return Response(ret_data, status=200)
+
+        # If filename and/or category are missing, generate diff for
+        # the whole samplesheet
+        categories = ('studies', 'assays')
+        for category in categories:
+            ret_data[category] = {}
+            for filename, data in source.data.get(category, {}).items():
+                ret_data[category][filename] = [
+                    [
+                        line.split('\t')
+                        for line in data['tsv'].replace('"', '').split('\n')
+                    ],
+                    [
+                        line.split('\t')
+                        for line in target.data.get(category, {})
+                        .get(filename, {})
+                        .get('tsv', '')
+                        .replace('"', '')
+                        .split('\n')
+                    ],
+                ]
+        for category in categories:
+            for filename, data in target.data.get(category, {}).items():
+                if filename not in ret_data[category]:
+                    ret_data[category][filename] = [
+                        [
+                            line.split('\t')
+                            for line in data['tsv'].replace('"', '').split('\n')
+                        ],
+                        [
+                            line.split('\t')
+                            for line in target.data.get(category, {})
+                            .get(filename, {})
+                            .get('tsv', '')
+                            .replace('"', '')
+                            .split('\n')
+                        ],
+                    ]
+        return Response(ret_data, status=200)

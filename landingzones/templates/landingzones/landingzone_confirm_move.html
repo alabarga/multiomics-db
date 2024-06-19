@@ -1,0 +1,49 @@
+{# Projectroles dependency #}
+{% extends 'projectroles/project_base.html' %}
+
+{% load rules %}
+{% load landingzones_tags %}
+
+{% block title %}
+  Confirm iRODS File Validation {% if not validate_only %}and Moving{% endif %}
+{% endblock title %}
+
+{% block projectroles_extend %}
+
+<div class="container-fluid sodar-subtitle-container">
+  <h3>Confirm iRODS File Validation {% if not validate_only %}and Moving{% endif %}</h3>
+</div>
+
+<div class="container-fluid sodar-page-container">
+  <div class="alert alert-warning" role="alert">
+    <strong>Note:</strong> You are initiating validation of your landing zone
+    "<strong>{{ zone.title }}</strong>". Files
+    <strong>will {% if validate_only %}not{% endif %}</strong>
+    be moved to the sample repository upon successful validation. Please see the
+    landing zone list for the validation result once you have confirmed the
+    action.
+  </div>
+
+  <form method="post">
+    {% csrf_token %}
+    <div class="row">
+      <div class="btn-group ml-auto">
+        <a role="button" class="btn btn-secondary" href="{{ request.session.real_referer }}">
+          <i class="iconify" data-icon="mdi:arrow-left-circle"></i> Cancel
+        </a>
+        {% if validate_only %}
+          <button type="submit" class="btn btn-primary sodar-btn-submit-once">
+            <i class="iconify" data-icon="mdi:check-thick"></i> Validate
+          </button>
+        {% else %}
+          <button type="submit" class="btn btn-danger sodar-btn-submit-once">
+            <i class="iconify" data-icon="mdi:arrow-right-bold-hexagon-outline"></i>
+            Validate and Move
+          </button>
+        {% endif %}
+      </div>
+    </div>
+  </form>
+</div>
+
+{% endblock %}
